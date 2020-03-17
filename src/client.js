@@ -2821,7 +2821,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(
     roomId, rmEventId, rrEvent, opts,
 ) {
     const room = this.getRoom(roomId);
-    if (room && room.hasPendingEvent(rmEventId)) {
+    if (room && (room._opts.pendingEventOrdering === "detached") && room.hasPendingEvent(rmEventId)) {
         throw new Error(`Cannot set read marker to a pending event (${rmEventId})`);
     }
 
@@ -2829,7 +2829,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(
     let rrEventId;
     if (rrEvent) {
         rrEventId = rrEvent.getId();
-        if (room && room.hasPendingEvent(rrEventId)) {
+        if (room && (room._opts.pendingEventOrdering === "detached") && room.hasPendingEvent(rrEventId)) {
             throw new Error(`Cannot set read receipt to a pending event (${rrEventId})`);
         }
         if (room) {
