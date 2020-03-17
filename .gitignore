@@ -11,7 +11,6 @@ coverage
 lib-cov
 out
 /dist
-/lib
 /specbuild
 /.idea
 
