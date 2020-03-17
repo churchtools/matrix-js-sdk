@@ -37,6 +37,7 @@ import {
     CrossSigningLevel,
     DeviceTrustLevel,
     UserTrustLevel,
+    createCryptoStoreCacheCallbacks,
 } from './CrossSigning';
 import {SECRET_STORAGE_ALGORITHM_V1, SecretStorage} from './SecretStorage';
 import {OutgoingRoomKeyRequestManager} from './OutgoingRoomKeyRequestManager';
@@ -54,6 +55,7 @@ import {InRoomChannel, InRoomRequests} from "./verification/request/InRoomChanne
 import {ToDeviceChannel, ToDeviceRequests} from "./verification/request/ToDeviceChannel";
 import * as httpApi from "../http-api";
 import {IllegalMethod} from "./verification/IllegalMethod";
+import {KeySignatureUploadError} from "../errors";
 
 const DeviceVerification = DeviceInfo.DeviceVerification;
 
@@ -220,8 +222,13 @@ export function Crypto(baseApis, sessionStore, userId, deviceId,
     this._inRoomVerificationRequests = new InRoomRequests();
 
     const cryptoCallbacks = this._baseApis._cryptoCallbacks || {};
+    const cacheCallbacks = createCryptoStoreCacheCallbacks(cryptoStore);
 
-    this._crossSigningInfo = new CrossSigningInfo(userId, cryptoCallbacks);
+    this._crossSigningInfo = new CrossSigningInfo(
+        userId,
+        cryptoCallbacks,
+        cacheCallbacks,
+    );
 
     this._secretStorage = new SecretStorage(
         baseApis, cryptoCallbacks, this._crossSigningInfo,
@@ -655,49 +662,84 @@ Crypto.prototype.resetCrossSigningKeys = async function(level, {
  * verifications, etc.
  */
 Crypto.prototype._afterCrossSigningLocalKeyChange = async function() {
+    logger.info("Starting cross-signing key change post-processing");
+
     // sign the current device with the new key, and upload to the server
     const device = this._deviceList.getStoredDevice(this._userId, this._deviceId);
     const signedDevice = await this._crossSigningInfo.signDevice(this._userId, device);
-    await this._baseApis.uploadKeySignatures({
-        [this._userId]: {
-            [this._deviceId]: signedDevice,
-        },
-    });
+    logger.info(`Starting background key sig upload for ${this._deviceId}`);
 
-    // check all users for signatures
-    // FIXME: do this in batches
-    const users = {};
-    for (const [userId, crossSigningInfo]
-         of Object.entries(this._deviceList._crossSigningInfo)) {
-        const upgradeInfo = await this._checkForDeviceVerificationUpgrade(
-            userId, CrossSigningInfo.fromStorage(crossSigningInfo, userId),
-        );
-        if (upgradeInfo) {
-            users[userId] = upgradeInfo;
-        }
-    }
+    const upload = ({ shouldEmit }) => {
+        return this._baseApis.uploadKeySignatures({
+            [this._userId]: {
+                [this._deviceId]: signedDevice,
+            },
+        }).then((response) => {
+            const { failures } = response || {};
+            if (Object.keys(failures || []).length > 0) {
+                if (shouldEmit) {
+                    this._baseApis.emit(
+                        "crypto.keySignatureUploadFailure",
+                        failures,
+                        "_afterCrossSigningLocalKeyChange",
+                        upload, // continuation
+                    );
+                }
+                throw new KeySignatureUploadError("Key upload failed", { failures });
+            }
+            logger.info(`Finished background key sig upload for ${this._deviceId}`);
+        }).catch(e => {
+            logger.error(
+                `Error during background key sig upload for ${this._deviceId}`,
+                e,
+            );
+        });
+    };
+    upload({ shouldEmit: true });
 
     const shouldUpgradeCb = (
         this._baseApis._cryptoCallbacks.shouldUpgradeDeviceVerifications
     );
-    if (Object.keys(users).length > 0 && shouldUpgradeCb) {
-        try {
-            const usersToUpgrade = await shouldUpgradeCb({users: users});
-            if (usersToUpgrade) {
-                for (const userId of usersToUpgrade) {
-                    if (userId in users) {
-                        await this._baseApis.setDeviceVerified(
-                            userId, users[userId].crossSigningInfo.getId(),
-                        );
+    if (shouldUpgradeCb) {
+        logger.info("Starting device verification upgrade");
+
+        // Check all users for signatures if upgrade callback present
+        // FIXME: do this in batches
+        const users = {};
+        for (const [userId, crossSigningInfo]
+            of Object.entries(this._deviceList._crossSigningInfo)) {
+            const upgradeInfo = await this._checkForDeviceVerificationUpgrade(
+                userId, CrossSigningInfo.fromStorage(crossSigningInfo, userId),
+            );
+            if (upgradeInfo) {
+                users[userId] = upgradeInfo;
+            }
+        }
+
+        if (Object.keys(users).length > 0) {
+            logger.info(`Found ${Object.keys(users).length} verif users to upgrade`);
+            try {
+                const usersToUpgrade = await shouldUpgradeCb({ users: users });
+                if (usersToUpgrade) {
+                    for (const userId of usersToUpgrade) {
+                        if (userId in users) {
+                            await this._baseApis.setDeviceVerified(
+                                userId, users[userId].crossSigningInfo.getId(),
+                            );
+                        }
                     }
                 }
+            } catch (e) {
+                logger.log(
+                    "shouldUpgradeDeviceVerifications threw an error: not upgrading", e,
+                );
             }
-        } catch (e) {
-            logger.log(
-                "shouldUpgradeDeviceVerifications threw an error: not upgrading", e,
-            );
         }
+
+        logger.info("Finished device verification upgrade");
     }
+
+    logger.info("Finished cross-signing key change post-processing");
 };
 
 /**
@@ -808,7 +850,19 @@ Crypto.prototype.checkUserTrust = function(userId) {
  */
 Crypto.prototype.checkDeviceTrust = function(userId, deviceId) {
     const device = this._deviceList.getStoredDevice(userId, deviceId);
-    const trustedLocally = device && device.isVerified();
+    return this._checkDeviceInfoTrust(userId, device);
+};
+
+/**
+ * Check whether a given deviceinfo is trusted.
+ *
+ * @param {string} userId The ID of the user whose devices is to be checked.
+ * @param {module:crypto/deviceinfo?} device The device info object to check
+ *
+ * @returns {DeviceTrustLevel}
+ */
+Crypto.prototype._checkDeviceInfoTrust = function(userId, device) {
+    const trustedLocally = !!(device && device.isVerified());
 
     const userCrossSigning = this._deviceList.getStoredCrossSigningForUser(userId);
     if (device && userCrossSigning) {
@@ -923,8 +977,33 @@ Crypto.prototype.checkOwnCrossSigningTrust = async function() {
             = this._crossSigningInfo.keys.master;
     }
 
-    if (Object.keys(keySignatures).length) {
-        await this._baseApis.uploadKeySignatures({[this._userId]: keySignatures});
+    const keysToUpload = Object.keys(keySignatures);
+    if (keysToUpload.length) {
+        const upload = ({ shouldEmit }) => {
+            logger.info(`Starting background key sig upload for ${keysToUpload}`);
+            return this._baseApis.uploadKeySignatures({ [this._userId]: keySignatures })
+            .then((response) => {
+                const { failures } = response || {};
+                logger.info(`Finished background key sig upload for ${keysToUpload}`);
+                if (Object.keys(failures || []).length > 0) {
+                    if (shouldEmit) {
+                        this._baseApis.emit(
+                            "crypto.keySignatureUploadFailure",
+                            failures,
+                            "checkOwnCrossSigningTrust",
+                            upload,
+                        );
+                    }
+                    throw new KeySignatureUploadError("Key upload failed", { failures });
+                }
+            }).catch(e => {
+                logger.error(
+                    `Error during background key sig upload for ${keysToUpload}`,
+                    e,
+                );
+            });
+        };
+        upload({ shouldEmit: true });
     }
 
     this.emit("userTrustStatusChanged", userId, this.checkUserTrust(userId));
@@ -962,16 +1041,21 @@ Crypto.prototype._storeTrustedSelfKeys = async function(keys) {
  * @param {string} userId the user ID whose key should be checked
  */
 Crypto.prototype._checkDeviceVerifications = async function(userId) {
+    const shouldUpgradeCb = (
+        this._baseApis._cryptoCallbacks.shouldUpgradeDeviceVerifications
+    );
+    if (!shouldUpgradeCb) {
+        // Upgrading skipped when callback is not present.
+        return;
+    }
+    logger.info(`Starting device verification upgrade for ${userId}`);
     if (this._crossSigningInfo.keys.user_signing) {
         const crossSigningInfo = this._deviceList.getStoredCrossSigningForUser(userId);
         if (crossSigningInfo) {
             const upgradeInfo = await this._checkForDeviceVerificationUpgrade(
                 userId, crossSigningInfo,
             );
-            const shouldUpgradeCb = (
-                this._baseApis._cryptoCallbacks.shouldUpgradeDeviceVerifications
-            );
-            if (upgradeInfo && shouldUpgradeCb) {
+            if (upgradeInfo) {
                 const usersToUpgrade = await shouldUpgradeCb({
                     users: {
                         [userId]: upgradeInfo,
@@ -985,6 +1069,7 @@ Crypto.prototype._checkDeviceVerifications = async function(userId) {
             }
         }
     }
+    logger.info(`Finished device verification upgrade for ${userId}`);
 };
 
 /**
@@ -1559,12 +1644,33 @@ Crypto.prototype.setDeviceVerification = async function(
             );
             const device = await this._crossSigningInfo.signUser(xsk);
             if (device) {
-                logger.info("Uploading signature for " + userId + "...");
-                await this._baseApis.uploadKeySignatures({
-                    [userId]: {
-                        [deviceId]: device,
-                    },
-                });
+                const upload = async ({ shouldEmit }) => {
+                    logger.info("Uploading signature for " + userId + "...");
+                    const response = await this._baseApis.uploadKeySignatures({
+                        [userId]: {
+                            [deviceId]: device,
+                        },
+                    });
+                    const { failures } = response || {};
+                    if (Object.keys(failures || []).length > 0) {
+                        if (shouldEmit) {
+                            this._baseApis.emit(
+                                "crypto.keySignatureUploadFailure",
+                                failures,
+                                "setDeviceVerification",
+                                upload,
+                            );
+                        }
+                        /* Throwing here causes the process to be cancelled and the other
+                        * user to be notified */
+                        throw new KeySignatureUploadError(
+                            "Key upload failed",
+                            { failures },
+                        );
+                    }
+                };
+                await upload({ shouldEmit: true });
+
                 // This will emit events when it comes back down the sync
                 // (we could do local echo to speed things up)
             }
@@ -1613,12 +1719,27 @@ Crypto.prototype.setDeviceVerification = async function(
             userId, DeviceInfo.fromStorage(dev, deviceId),
         );
         if (device) {
-            logger.info("Uploading signature for " + deviceId);
-            await this._baseApis.uploadKeySignatures({
-                [userId]: {
-                    [deviceId]: device,
-                },
-            });
+            const upload = async ({shouldEmit}) => {
+                logger.info("Uploading signature for " + deviceId);
+                const response = await this._baseApis.uploadKeySignatures({
+                    [userId]: {
+                        [deviceId]: device,
+                    },
+                });
+                const { failures } = response || {};
+                if (Object.keys(failures || []).length > 0) {
+                    if (shouldEmit) {
+                        this._baseApis.emit(
+                            "crypto.keySignatureUploadFailure",
+                            failures,
+                            "_afterCrossSigningLocalKeyChange",
+                            upload, // continuation
+                        );
+                    }
+                    throw new KeySignatureUploadError("Key upload failed", { failures });
+                }
+            };
+            await upload({shouldEmit: true});
             // XXX: we'll need to wait for the device list to be updated
         }
     }
@@ -1703,6 +1824,27 @@ Crypto.prototype.beginKeyVerification = function(
             userId, transactionId, request);
     }
     return request.beginKeyVerification(method, {userId, deviceId});
+};
+
+Crypto.prototype.legacyDeviceVerification = async function(
+    userId, deviceId, method,
+) {
+    const transactionId = ToDeviceChannel.makeTransactionId();
+    const channel = new ToDeviceChannel(
+        this._baseApis, userId, [deviceId], transactionId, deviceId);
+    const request = new VerificationRequest(
+        channel, this._verificationMethods, this._baseApis);
+    this._toDeviceVerificationRequests.setRequestBySenderAndTxnId(
+        userId, transactionId, request);
+    const verifier = request.beginKeyVerification(method, {userId, deviceId});
+    // either reject by an error from verify() while sending .start
+    // or resolve when the request receives the
+    // local (fake remote) echo for sending the .start event
+    await Promise.race([
+        verifier.verify(),
+        request.waitFor(r => r.started),
+    ]);
+    return request;
 };
 
 
@@ -2122,14 +2264,18 @@ Crypto.prototype._backupPendingKeys = async function(limit) {
         const forwardedCount =
               (sessionData.forwarding_curve25519_key_chain || []).length;
 
+        const userId = this._deviceList.getUserByIdentityKey(
+            olmlib.MEGOLM_ALGORITHM, session.senderKey,
+        );
         const device = this._deviceList.getDeviceByIdentityKey(
             olmlib.MEGOLM_ALGORITHM, session.senderKey,
         );
+        const verified = this._checkDeviceInfoTrust(userId, device).isVerified();
 
         data[roomId]['sessions'][session.sessionId] = {
             first_message_index: firstKnownIndex,
             forwarded_count: forwardedCount,
-            is_verified: !!(device && device.isVerified()),
+            is_verified: verified,
             session_data: encrypted,
         };
     }
@@ -2661,12 +2807,7 @@ Crypto.prototype._handleVerificationEvent = async function(
     }
     event.setVerificationRequest(request);
     try {
-        const hadVerifier = !!request.verifier;
         await request.channel.handleEvent(event, request, isLiveEvent);
-        // emit start event when verifier got set
-        if (!hadVerifier && request.verifier) {
-            this._baseApis.emit("crypto.verification.start", request.verifier);
-        }
     } catch (err) {
         logger.error("error while handling verification event: " + err.message);
     }
@@ -2964,9 +3105,8 @@ Crypto.prototype._processReceivedRoomKeyRequest = async function(req) {
         decryptor.shareKeysWithDevice(req);
     };
 
-    // if the device is is verified already, share the keys
-    const device = this._deviceList.getStoredDevice(userId, deviceId);
-    if (device && device.isVerified()) {
+    // if the device is verified already, share the keys
+    if (this.checkDeviceTrust(userId, deviceId).isVerified()) {
         logger.log('device is already verified: sharing keys');
         req.share();
         return;

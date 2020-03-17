@@ -341,9 +341,26 @@ export class Backend {
         };
     }
 
+    getCrossSigningPrivateKey(txn, func, type) {
+        const objectStore = txn.objectStore("account");
+        const getReq = objectStore.get(`ssss_cache:${type}`);
+        getReq.onsuccess = function() {
+            try {
+                func(getReq.result || null);
+            } catch (e) {
+                abortWithException(txn, e);
+            }
+        };
+    }
+
     storeCrossSigningKeys(txn, keys) {
         const objectStore = txn.objectStore("account");
         objectStore.put(keys, "crossSigningKeys");
+    }
+
+    storeCrossSigningPrivateKey(txn, type, key) {
+        const objectStore = txn.objectStore("account");
+        objectStore.put(key, `ssss_cache:${type}`);
     }
 
     // Olm Sessions
@@ -352,7 +369,11 @@ export class Backend {
         const objectStore = txn.objectStore("sessions");
         const countReq = objectStore.count();
         countReq.onsuccess = function() {
-            func(countReq.result);
+            try {
+                func(countReq.result);
+            } catch (e) {
+                abortWithException(txn, e);
+            }
         };
     }
 
@@ -402,16 +423,16 @@ export class Backend {
         const objectStore = txn.objectStore("sessions");
         const getReq = objectStore.openCursor();
         getReq.onsuccess = function() {
-            const cursor = getReq.result;
-            if (cursor) {
-                func(cursor.value);
-                cursor.continue();
-            } else {
-                try {
+            try {
+                const cursor = getReq.result;
+                if (cursor) {
+                    func(cursor.value);
+                    cursor.continue();
+                } else {
                     func(null);
-                } catch (e) {
-                    abortWithException(txn, e);
                 }
+            } catch (e) {
+                abortWithException(txn, e);
             }
         };
     }

@@ -407,9 +407,9 @@ export function MatrixClient(opts) {
                     break;
                 }
 
-                highlightCount += this.getPushActionsForEvent(
-                    event,
-                ).tweaks.highlight ? 1 : 0;
+                const pushActions = this.getPushActionsForEvent(event);
+                highlightCount += pushActions.tweaks &&
+                    pushActions.tweaks.highlight ? 1 : 0;
             }
 
             // Note: we don't need to handle 'total' notifications because the counts
@@ -684,6 +684,9 @@ MatrixClient.prototype.initCrypto = async function() {
         // the cryptostore is provided by sdk.createClient, so this shouldn't happen
         throw new Error(`Cannot enable encryption: no cryptoStore provided`);
     }
+
+    logger.log("Crypto: Starting up crypto store...");
+    await this._cryptoStore.startup();
 
     // initialise the list of encrypted rooms (whether or not crypto is enabled)
     logger.log("Crypto: initialising roomlist...");
@@ -1132,6 +1135,7 @@ wrapCryptoFuncs(MatrixClient, [
     "checkDeviceTrust",
     "checkOwnCrossSigningTrust",
     "checkCrossSigningPrivateKey",
+    "legacyDeviceVerification",
 ]);
 
 /**
@@ -2408,7 +2412,7 @@ function _sendEvent(client, room, event, callback) {
         let promise;
         // this event may be queued
         if (client.scheduler) {
-            // if this returns a promsie then the scheduler has control now and will
+            // if this returns a promise then the scheduler has control now and will
             // resolve/reject when it is done. Internally, the scheduler will invoke
             // processFn which is set to this._sendEventHttpRequest so the same code
             // path is executed regardless.
@@ -2817,7 +2821,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(
     roomId, rmEventId, rrEvent, opts,
 ) {
     const room = this.getRoom(roomId);
-    if (room && room.hasPendingEvent(rmEventId)) {
+    if (room && (room._opts.pendingEventOrdering === "detached") && room.hasPendingEvent(rmEventId)) {
         throw new Error(`Cannot set read marker to a pending event (${rmEventId})`);
     }
 
@@ -2825,7 +2829,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(
     let rrEventId;
     if (rrEvent) {
         rrEventId = rrEvent.getId();
-        if (room && room.hasPendingEvent(rrEventId)) {
+        if (room && (room._opts.pendingEventOrdering === "detached") && room.hasPendingEvent(rrEventId)) {
             throw new Error(`Cannot set read receipt to a pending event (${rrEventId})`);
         }
         if (room) {
@@ -5178,6 +5182,15 @@ MatrixClient.prototype.getEventMapper = function() {
     return _PojoToMatrixEventMapper(this);
 };
 
+/**
+ * The app may wish to see if we have a key cached without
+ * triggering a user interaction.
+ * @return {object}
+ */
+MatrixClient.prototype.getCrossSigningCacheCallbacks = function() {
+    return this._crypto && this._crypto._crossSigningInfo.getCacheCallbacks();
+};
+
 // Identity Server Operations
 // ==========================
 
@@ -5492,13 +5505,6 @@ MatrixClient.prototype.generateClientSecret = function() {
  * @param {string} userId the user ID who requested the key verification
  * @param {Function} cancel a function that will send a cancellation message to
  *     reject the key verification.
- */
-
-/**
- * Fires when a key verification started message is received.
- * @event module:client~MatrixClient#"crypto.verification.start"
- * @param {module:crypto/verification/Base} verifier a verifier object to
- *     perform the key verification
  */
 
 /**

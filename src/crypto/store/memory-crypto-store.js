@@ -33,6 +33,7 @@ export class MemoryCryptoStore {
         this._outgoingRoomKeyRequests = [];
         this._account = null;
         this._crossSigningKeys = null;
+        this._privateKeys = {};
 
         // Map of {devicekey -> {sessionId -> session pickle}}
         this._sessions = {};
@@ -49,6 +50,18 @@ export class MemoryCryptoStore {
         this._rooms = {};
         // Set of {senderCurve25519Key+'/'+sessionId}
         this._sessionsNeedingBackup = {};
+    }
+
+    /**
+     * Ensure the database exists and is up-to-date.
+     *
+     * This must be called before the store can be used.
+     *
+     * @return {Promise} resolves to the store.
+     */
+    async startup() {
+        // No startup work to do for the memory store.
+        return this;
     }
 
     /**
@@ -243,8 +256,17 @@ export class MemoryCryptoStore {
         func(this._crossSigningKeys);
     }
 
+    getCrossSigningPrivateKey(txn, func, type) {
+        const result = this._privateKeys[type];
+        return func(result || null);
+    }
+
     storeCrossSigningKeys(txn, keys) {
         this._crossSigningKeys = keys;
+    }
+
+    storeCrossSigningPrivateKey(txn, type, key) {
+        this._privateKeys[type] = key;
     }
 
     // Olm Sessions
