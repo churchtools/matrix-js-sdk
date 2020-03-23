@@ -1153,6 +1153,8 @@ SyncApi.prototype._processSyncResponse = async function(
 
     // Handle joins
     await utils.promiseMapSeries(joinRooms, async function(joinObj) {
+        await utils.sleep(0);
+
         const room = joinObj.room;
         const stateEvents = self._mapSyncEventsFormat(joinObj.state, room);
         const timelineEvents = self._mapSyncEventsFormat(joinObj.timeline, room);
